@@ -30,10 +30,11 @@ import com.google.ar.core.Config
 import com.google.ar.core.Frame
 import com.google.ar.core.Plane
 import com.google.ar.core.Pose
+import com.google.ar.core.Session
+import com.google.ar.core.TrackingState
 import io.github.sceneview.ar.ARScene
 import io.github.sceneview.ar.rememberARCameraStream
 import io.github.sceneview.rememberOnGestureListener
-import io.github.sceneview.node.Node
 import io.github.sceneview.rememberEngine
 import io.github.sceneview.rememberMaterialLoader
 import io.github.sceneview.rememberModelLoader
@@ -46,6 +47,48 @@ import kotlin.math.sqrt
 
 /** A single room corner captured from a floor tap, in meters, ARCore world space. */
 data class RoomCorner(val x: Float, val y: Float, val z: Float)
+
+/**
+ * A door or window cut into one wall. wallIndex refers to the wall between
+ * finishedCorners[wallIndex] and finishedCorners[wallIndex + 1]. startOffset
+ * and endOffset are distances (meters) along that wall from its first
+ * corner. sillHeight/headerHeight are heights (meters) above the floor —
+ * for a door, sillHeight is expected to be close to 0.
+ */
+data class Opening(
+    val wallIndex: Int,
+    val startOffset: Float,
+    val endOffset: Float,
+    val sillHeight: Float,
+    val headerHeight: Float,
+    val type: String // "door" or "window"
+)
+
+/**
+ * An auto-detected candidate opening, not yet confirmed as a door or window
+ * by the user. Comes from finding a gap in ARCore's vertical-plane coverage
+ * along a wall — since a real opening (no wall surface, or glass) usually
+ * prevents one continuous plane from forming across it.
+ */
+data class CandidateOpening(
+    val wallIndex: Int,
+    val startOffset: Float,
+    val endOffset: Float,
+    val estimatedSill: Float,
+    val estimatedHeader: Float
+)
+
+/** A gap narrower than this is probably just noise/a small unscanned patch, not a real opening. */
+private const val MIN_GAP_WIDTH_METERS = 0.4f
+
+/** A gap wider than this is probably a whole missing wall segment, not a door/window. */
+private const val MAX_GAP_WIDTH_METERS = 3.0f
+
+/** How close a vertical plane's fragment must be to a wall's line to be considered part of that wall. */
+private const val WALL_MATCH_DISTANCE_METERS = 0.5f
+
+/** Coverage intervals closer together than this are merged as one continuous piece of wall. */
+private const val COVERAGE_MERGE_TOLERANCE_METERS = 0.15f
 
 /**
  * Step 4: automatic room-height detection.
@@ -71,7 +114,7 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-private enum class TapMode { PLACING_CORNERS, CALIBRATING_HEIGHT }
+private enum class TapMode { PLACING_CORNERS, CALIBRATING_HEIGHT, PLACING_OPENING }
 
 /** Taps closer together than this (meters) are treated as accidental duplicates. */
 private const val MIN_CORNER_SPACING_METERS = 0.15f
@@ -100,6 +143,14 @@ fun RoomScanScreen(filesDir: File) {
     var tapMode by remember { mutableStateOf(TapMode.PLACING_CORNERS) }
     var calibrationFirstPoint by remember { mutableStateOf<Pose?>(null) }
 
+    // --- Openings (doors/windows) state ---
+    var finishedCorners by remember { mutableStateOf<List<RoomCorner>>(emptyList()) }
+    val openings = remember { mutableStateListOf<Opening>() }
+    var currentOpeningType by remember { mutableStateOf("door") }
+    val openingTapPoints = remember { mutableStateListOf<Pose>() }
+    var arSession by remember { mutableStateOf<Session?>(null) }
+    val candidateOpenings = remember { mutableStateListOf<CandidateOpening>() }
+
     Box(modifier = Modifier.fillMaxSize()) {
 
         ARScene(
@@ -115,6 +166,7 @@ fun RoomScanScreen(filesDir: File) {
 
             onSessionUpdated = { session, updatedFrame ->
                 frame = updatedFrame
+                arSession = session
                 val allPlanes = session.getAllTrackables(Plane::class.java)
                 verticalCount = allPlanes.count { it.type == Plane.Type.VERTICAL }
                 horizontalCount = allPlanes.size - verticalCount
@@ -138,7 +190,7 @@ fun RoomScanScreen(filesDir: File) {
             },
 
             onGestureListener = rememberOnGestureListener(
-                onSingleTapConfirmed = { motionEvent: android.view.MotionEvent, _ ->
+                onSingleTapConfirmed = { motionEvent, _ ->
                     val currentFrame = frame ?: return@rememberOnGestureListener
                     val hitResults = currentFrame.hitTest(motionEvent.x, motionEvent.y)
 
@@ -201,6 +253,52 @@ fun RoomScanScreen(filesDir: File) {
                                 Log.d("ARTest", "Manually calibrated height: $dist m")
                             }
                         }
+
+                        TapMode.PLACING_OPENING -> {
+                            // First two taps: bottom-left and bottom-right of the
+                            // opening — prefer a floor hit for these since they're
+                            // usually low, but fall back to any surface (a door
+                            // sill is right at floor level, but a window's sill
+                            // sits up on the wall itself with no floor plane there).
+                            val floorHit = hitResults.firstOrNull {
+                                val trackable = it.trackable
+                                trackable is Plane &&
+                                        trackable.type == Plane.Type.HORIZONTAL_UPWARD_FACING &&
+                                        trackable.isPoseInPolygon(it.hitPose)
+                            }
+                            val anyHit = floorHit ?: hitResults.firstOrNull()
+
+                            if (anyHit == null) {
+                                lastTapResult = "No surface detected there — try again"
+                                return@rememberOnGestureListener
+                            }
+
+                            openingTapPoints.add(anyHit.hitPose)
+
+                            when (openingTapPoints.size) {
+                                1 -> lastTapResult = "Tap the OTHER bottom corner of the $currentOpeningType"
+                                2 -> lastTapResult = "Now tap the TOP of the $currentOpeningType (header height)"
+                                3 -> {
+                                    val opening = buildOpening(
+                                        openingTapPoints[0],
+                                        openingTapPoints[1],
+                                        openingTapPoints[2],
+                                        finishedCorners,
+                                        currentOpeningType
+                                    )
+                                    if (opening != null) {
+                                        openings.add(opening)
+                                        lastTapResult = "${currentOpeningType.replaceFirstChar { it.uppercase() }} added " +
+                                                "on wall ${opening.wallIndex + 1} (width %.2f m)".format(opening.endOffset - opening.startOffset)
+                                        saveRoomJson(filesDir, finishedCorners, roomHeight ?: 0f, heightSource, openings)
+                                    } else {
+                                        lastTapResult = "Couldn't match those taps to a wall — try again, closer to the wall"
+                                    }
+                                    openingTapPoints.clear()
+                                    tapMode = TapMode.PLACING_CORNERS
+                                }
+                            }
+                        }
                     }
                 }
             )
@@ -215,6 +313,9 @@ fun RoomScanScreen(filesDir: File) {
             Text(text = "Floor planes: $horizontalCount", color = Color.Cyan)
             Text(text = "Wall planes: $verticalCount", color = Color.Green)
             Text(text = "Corners placed: ${corners.size}", color = Color.White)
+            if (openings.isNotEmpty()) {
+                Text(text = "Openings: ${openings.size}", color = Color.White)
+            }
             val heightText = roomHeight?.let { "Room height: %.2f m ($heightSource)".format(it) }
                 ?: "Room height: $heightSource — point phone at ceiling"
             Text(text = heightText, color = Color.Magenta)
@@ -257,11 +358,12 @@ fun RoomScanScreen(filesDir: File) {
                         }
                         val simplified = simplifyCollinearPoints(corners)
                         roomFinished = true
+                        finishedCorners = simplified
                         summary = buildRoomSummary(simplified, roomHeight!!) +
                                 if (simplified.size != corners.size)
                                     "\n(merged ${corners.size - simplified.size} redundant point(s) along straight walls)"
                                 else ""
-                        saveRoomJson(filesDir, simplified, roomHeight!!, heightSource)
+                        saveRoomJson(filesDir, simplified, roomHeight!!, heightSource, openings)
                     }
                 ) { Text("Finish Room") }
 
@@ -269,6 +371,11 @@ fun RoomScanScreen(filesDir: File) {
                     onClick = {
                         corners.clear()
                         roomFinished = false
+                        finishedCorners = emptyList()
+                        openings.clear()
+                        candidateOpenings.clear()
+                        openingTapPoints.clear()
+                        tapMode = TapMode.PLACING_CORNERS
                         summary = ""
                         lastTapResult = "Cleared. Tap the floor to place a corner"
                     }
@@ -293,6 +400,83 @@ fun RoomScanScreen(filesDir: File) {
             }
 
             if (roomFinished) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    Button(
+                        onClick = {
+                            val session = arSession
+                            if (session != null) {
+                                candidateOpenings.clear()
+                                candidateOpenings.addAll(scanForOpenings(session, finishedCorners))
+                                lastTapResult = if (candidateOpenings.isEmpty())
+                                    "No gaps found — scan walls more, or use Add Door/Window manually"
+                                else
+                                    "${candidateOpenings.size} possible opening(s) found — confirm below"
+                            }
+                        }
+                    ) { Text("Auto-Detect Openings") }
+                }
+
+                candidateOpenings.forEachIndexed { index, candidate ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(vertical = 2.dp),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        Text(
+                            text = "Wall ${candidate.wallIndex + 1}, %.2f m wide".format(candidate.endOffset - candidate.startOffset),
+                            color = Color.White
+                        )
+                        Button(onClick = {
+                            openings.add(
+                                Opening(
+                                    candidate.wallIndex, candidate.startOffset, candidate.endOffset,
+                                    candidate.estimatedSill, candidate.estimatedHeader, "door"
+                                )
+                            )
+                            candidateOpenings.removeAt(index)
+                            saveRoomJson(filesDir, finishedCorners, roomHeight ?: 0f, heightSource, openings)
+                        }) { Text("Door") }
+                        Button(onClick = {
+                            openings.add(
+                                Opening(
+                                    candidate.wallIndex, candidate.startOffset, candidate.endOffset,
+                                    candidate.estimatedSill, candidate.estimatedHeader, "window"
+                                )
+                            )
+                            candidateOpenings.removeAt(index)
+                            saveRoomJson(filesDir, finishedCorners, roomHeight ?: 0f, heightSource, openings)
+                        }) { Text("Window") }
+                        Button(onClick = { candidateOpenings.removeAt(index) }) { Text("Ignore") }
+                    }
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceEvenly
+                ) {
+                    Button(
+                        onClick = {
+                            currentOpeningType = "door"
+                            openingTapPoints.clear()
+                            tapMode = TapMode.PLACING_OPENING
+                            lastTapResult = "Tap one bottom corner of the door"
+                        }
+                    ) { Text("Add Door") }
+
+                    Button(
+                        onClick = {
+                            currentOpeningType = "window"
+                            openingTapPoints.clear()
+                            tapMode = TapMode.PLACING_OPENING
+                            lastTapResult = "Tap one bottom corner of the window"
+                        }
+                    ) { Text("Add Window") }
+                }
+
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     horizontalArrangement = Arrangement.Center
@@ -347,7 +531,200 @@ private fun simplifyCollinearPoints(points: List<RoomCorner>): List<RoomCorner> 
     return result
 }
 
-/** Closes the polygon (last corner back to first) and reports each wall's length. */
+/**
+ * Scans all currently-tracked vertical planes and looks for gaps in wall
+ * coverage — places where a wall's line has no plane, or a break between
+ * two separate plane fragments. A real door or window usually causes
+ * exactly this pattern, since ARCore can't form one continuous surface
+ * across an opening (no wall there, or glass with too few feature points).
+ *
+ * This is a heuristic, not true object recognition — it can miss openings
+ * that haven't been scanned enough, and can occasionally flag a large
+ * unscanned patch of blank wall as a false positive. That's why results
+ * come back as CandidateOpenings for the user to confirm/classify, not
+ * openings added directly.
+ */
+private fun scanForOpenings(session: Session, finishedCorners: List<RoomCorner>): List<CandidateOpening> {
+    if (finishedCorners.size < 3) return emptyList()
+
+    val verticalPlanes = session.getAllTrackables(Plane::class.java)
+        .filter { it.type == Plane.Type.VERTICAL && it.trackingState == TrackingState.TRACKING }
+
+    val floorRefY = finishedCorners.map { it.y }.average().toFloat()
+    val candidates = mutableListOf<CandidateOpening>()
+
+    data class Interval(val start: Float, val end: Float, val yMin: Float, val yMax: Float)
+
+    for (wallIdx in finishedCorners.indices) {
+        val a = finishedCorners[wallIdx]
+        val b = finishedCorners[(wallIdx + 1) % finishedCorners.size]
+        val wallLength = distance(a, b)
+        if (wallLength < 0.3f) continue
+
+        val intervals = mutableListOf<Interval>()
+
+        verticalPlanes.forEach { plane ->
+            val polygon = plane.polygon
+            polygon.rewind()
+            val worldPoints = mutableListOf<FloatArray>()
+            while (polygon.hasRemaining()) {
+                val lx = polygon.get()
+                val lz = polygon.get()
+                worldPoints.add(plane.centerPose.transformPoint(floatArrayOf(lx, 0f, lz)))
+            }
+            if (worldPoints.isEmpty()) return@forEach
+
+            val nearWall = worldPoints.any {
+                pointToSegmentDistance(it[0], it[2], a.x, a.z, b.x, b.z) < WALL_MATCH_DISTANCE_METERS
+            }
+            if (!nearWall) return@forEach
+
+            val offsets = worldPoints.map { projectOntoSegment(it[0], it[2], a.x, a.z, b.x, b.z) * wallLength }
+            val ys = worldPoints.map { it[1] - floorRefY }
+            intervals.add(Interval(offsets.min(), offsets.max(), ys.min(), ys.max()))
+        }
+
+        if (intervals.isEmpty()) continue
+
+        // Merge overlapping/near-touching plane fragments into continuous coverage
+        val sorted = intervals.sortedBy { it.start }
+        val merged = mutableListOf<Interval>()
+        sorted.forEach { iv ->
+            val last = merged.lastOrNull()
+            if (last != null && iv.start - last.end < COVERAGE_MERGE_TOLERANCE_METERS) {
+                merged[merged.size - 1] = Interval(
+                    last.start, maxOf(last.end, iv.end),
+                    minOf(last.yMin, iv.yMin), maxOf(last.yMax, iv.yMax)
+                )
+            } else {
+                merged.add(iv)
+            }
+        }
+
+        // Walk the merged coverage looking for gaps within [0, wallLength]
+        var cursor = 0f
+        var previous: Interval? = null
+        for (iv in merged) {
+            val gapWidth = iv.start - cursor
+            if (gapWidth in MIN_GAP_WIDTH_METERS..MAX_GAP_WIDTH_METERS) {
+                candidates.add(
+                    CandidateOpening(
+                        wallIndex = wallIdx,
+                        startOffset = cursor,
+                        endOffset = iv.start,
+                        // If there's wall coverage below this gap, its top is
+                        // a good estimate for the opening's sill (a window
+                        // sitting above solid wall). Otherwise assume it
+                        // reaches the floor, like a door.
+                        estimatedSill = previous?.yMax?.coerceAtLeast(0f) ?: 0f,
+                        estimatedHeader = iv.yMax.coerceIn(1.0f, 3.0f)
+                    )
+                )
+            }
+            cursor = maxOf(cursor, iv.end)
+            previous = iv
+        }
+        val trailingGap = wallLength - cursor
+        if (trailingGap in MIN_GAP_WIDTH_METERS..MAX_GAP_WIDTH_METERS) {
+            candidates.add(
+                CandidateOpening(
+                    wallIndex = wallIdx,
+                    startOffset = cursor,
+                    endOffset = wallLength,
+                    estimatedSill = previous?.yMax?.coerceAtLeast(0f) ?: 0f,
+                    estimatedHeader = previous?.yMax?.coerceIn(1.0f, 3.0f) ?: 2.0f
+                )
+            )
+        }
+    }
+
+    return candidates
+}
+
+/**
+ * Given two taps marking the bottom-left/bottom-right of an opening and a
+ * third tap marking its top, finds which wall of the finished room polygon
+ * the opening belongs to, and computes its offset along that wall plus its
+ * sill/header heights above the floor.
+ *
+ * Returns null if the taps don't land close enough to any wall to be
+ * confidently assigned — the caller should ask the user to try again.
+ */
+private fun buildOpening(
+    bottomA: Pose,
+    bottomB: Pose,
+    top: Pose,
+    finishedCorners: List<RoomCorner>,
+    type: String
+): Opening? {
+    if (finishedCorners.size < 3) return null
+
+    val midX = (bottomA.tx() + bottomB.tx()) / 2f
+    val midZ = (bottomA.tz() + bottomB.tz()) / 2f
+
+    // Find the nearest wall segment (edge of the polygon) to the midpoint
+    // of the two bottom taps — this is "which wall is this opening on".
+    var bestWallIndex = -1
+    var bestDistance = Float.MAX_VALUE
+
+    for (i in finishedCorners.indices) {
+        val a = finishedCorners[i]
+        val b = finishedCorners[(i + 1) % finishedCorners.size]
+        val dist = pointToSegmentDistance(midX, midZ, a.x, a.z, b.x, b.z)
+        if (dist < bestDistance) {
+            bestDistance = dist
+            bestWallIndex = i
+        }
+    }
+
+    // If the taps are more than ~1m from every wall, something's off —
+    // don't silently assign a wrong wall.
+    if (bestWallIndex == -1 || bestDistance > 1.0f) return null
+
+    val wallA = finishedCorners[bestWallIndex]
+    val wallB = finishedCorners[(bestWallIndex + 1) % finishedCorners.size]
+    val wallLength = distance(wallA, wallB)
+    if (wallLength < 0.01f) return null
+
+    val offsetA = projectOntoSegment(bottomA.tx(), bottomA.tz(), wallA.x, wallA.z, wallB.x, wallB.z) * wallLength
+    val offsetB = projectOntoSegment(bottomB.tx(), bottomB.tz(), wallA.x, wallA.z, wallB.x, wallB.z) * wallLength
+
+    val floorRefY = finishedCorners.map { it.y }.average().toFloat()
+    val sillHeight = ((bottomA.ty() + bottomB.ty()) / 2f) - floorRefY
+    val headerHeight = top.ty() - floorRefY
+
+    if (headerHeight <= sillHeight) return null // top tap was below the bottom taps — bad capture
+
+    return Opening(
+        wallIndex = bestWallIndex,
+        startOffset = minOf(offsetA, offsetB),
+        endOffset = maxOf(offsetA, offsetB),
+        sillHeight = sillHeight.coerceAtLeast(0f),
+        headerHeight = headerHeight,
+        type = type
+    )
+}
+
+/** Shortest distance from point (px, pz) to the line segment (ax,az)-(bx,bz). */
+private fun pointToSegmentDistance(px: Float, pz: Float, ax: Float, az: Float, bx: Float, bz: Float): Float {
+    val t = projectOntoSegment(px, pz, ax, az, bx, bz).coerceIn(0f, 1f)
+    val closestX = ax + (bx - ax) * t
+    val closestZ = az + (bz - az) * t
+    val dx = px - closestX
+    val dz = pz - closestZ
+    return sqrt(dx * dx + dz * dz)
+}
+
+/** Returns how far along segment (ax,az)-(bx,bz) the point (px,pz) projects to, as a 0..1 fraction (unclamped). */
+private fun projectOntoSegment(px: Float, pz: Float, ax: Float, az: Float, bx: Float, bz: Float): Float {
+    val dx = bx - ax
+    val dz = bz - az
+    val lengthSquared = dx * dx + dz * dz
+    if (lengthSquared < 0.0001f) return 0f
+    return ((px - ax) * dx + (pz - az) * dz) / lengthSquared
+}
+
+
 private fun buildRoomSummary(corners: List<RoomCorner>, height: Float): String {
     val lines = StringBuilder()
     var perimeter = 0f
@@ -369,8 +746,14 @@ private fun distance(a: RoomCorner, b: RoomCorner): Float {
     return sqrt(dx * dx + dz * dz)
 }
 
-/** Saves the finished room outline + height as room.json in internal storage. */
-private fun saveRoomJson(filesDir: File, corners: List<RoomCorner>, height: Float, heightSource: String) {
+/** Saves the finished room outline + height + openings as room.json in internal storage. */
+private fun saveRoomJson(
+    filesDir: File,
+    corners: List<RoomCorner>,
+    height: Float,
+    heightSource: String,
+    openings: List<Opening>
+) {
     val pointsArray = JSONArray()
     corners.forEach { c ->
         val point = JSONObject()
@@ -379,10 +762,24 @@ private fun saveRoomJson(filesDir: File, corners: List<RoomCorner>, height: Floa
         point.put("z", c.z)
         pointsArray.put(point)
     }
+
+    val openingsArray = JSONArray()
+    openings.forEach { o ->
+        val openingJson = JSONObject()
+        openingJson.put("wallIndex", o.wallIndex)
+        openingJson.put("startOffset", o.startOffset)
+        openingJson.put("endOffset", o.endOffset)
+        openingJson.put("sillHeight", o.sillHeight)
+        openingJson.put("headerHeight", o.headerHeight)
+        openingJson.put("type", o.type)
+        openingsArray.put(openingJson)
+    }
+
     val root = JSONObject()
     root.put("points", pointsArray)
     root.put("wallHeight", height)
     root.put("heightSource", heightSource)
+    root.put("openings", openingsArray)
 
     val file = File(filesDir, "room.json")
     file.writeText(root.toString(2))
